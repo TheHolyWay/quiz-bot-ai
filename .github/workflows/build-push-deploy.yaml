@@ -27,10 +27,10 @@ jobs:
           echo "owner_lc=$OWNER_LC" >> $GITHUB_OUTPUT
           echo "branch_tag=$BRANCH_TAG" >> $GITHUB_OUTPUT
 
-      - name: Set up QEMU
+      - name: Setup QEMU
         uses: docker/setup-qemu-action@v3
 
-      - name: Set up Buildx
+      - name: Setup Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
@@ -40,7 +40,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & Push image to GHCR
+      - name: Build & Push image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -58,90 +58,86 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure jq is present
+      - name: Install jq
         run: sudo apt-get update -qq && sudo apt-get install -y jq
 
-      - name: Prepare tags (owner lowercase + branch tag)
+      - name: Prepare image tag
         id: prep
         run: |
           OWNER_LC=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
           BRANCH_TAG=${GITHUB_REF_NAME//\//-}
-          echo "owner_lc=$OWNER_LC" >> $GITHUB_OUTPUT
-          echo "branch_tag=$BRANCH_TAG" >> $GITHUB_OUTPUT
-          # endpoint id default
-          echo "endpoint_id=${{ secrets.PORTAINER_ENDPOINT_ID || '1' }}" >> $GITHUB_OUTPUT
+          echo "image=ghcr.io/${OWNER_LC}/${{ env.IMAGE_NAME }}:${BRANCH_TAG}" >> $GITHUB_OUTPUT
 
-      - name: Login to Portainer API (with checks)
+      - name: Login to Portainer (JWT)
         id: portainer_auth
         env:
-          BASEURL: ${{ secrets.PORTAINER_BASEURL }}
-          USER:    ${{ secrets.PORTAINER_USER }}
-          PASS:    ${{ secrets.PORTAINER_PASS }}
+          BASEURL:  ${{ secrets.PORTAINER_BASEURL }}   # напр. https://portainer.example.com:9443
+          USER:     ${{ secrets.PORTAINER_USER }}
+          PASS:     ${{ secrets.PORTAINER_PASS }}
+          INSECURE: ${{ secrets.PORTAINER_INSECURE }}  # "true" для self-signed
         run: |
-          if [ -z "$BASEURL" ]; then
-            echo "❌ PORTAINER_BASEURL is empty. Example: https://portainer.example.com:9443"
-            exit 1
-          fi
-          echo "→ Auth to $BASEURL ..."
-          # забираем и тело и код ответа
-          HTTP_CODE=$(mktemp)
-          RESP=$(curl -fsS -m 20 -w "%{http_code}" -o "$HTTP_CODE" \
-            -X POST "$BASEURL/api/auth" \
-            -H "Content-Type: application/json" \
-            -d "{\"username\":\"$USER\",\"password\":\"$PASS\"}" || true)
-          BODY=$(cat "$HTTP_CODE"); rm -f "$HTTP_CODE"
+          [ -z "$BASEURL" ] && echo "PORTAINER_BASEURL is empty" && exit 1
+          CURL_FLAGS="-sS"
+          [ "$INSECURE" = "true" ] && CURL_FLAGS="$CURL_FLAGS -k"
 
-          if [ "$RESP" != "200" ]; then
-            echo "❌ Portainer auth HTTP $RESP. Body: $BODY"
-            exit 1
-          fi
+          echo "→ Auth to $BASEURL"
+          RESP=$(curl $CURL_FLAGS -X POST "$BASEURL/api/auth" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"username\":\"$USER\",\"password\":\"$PASS\"}" \
+                  --write-out "\n%{http_code}")
+          BODY=$(echo "$RESP" | head -n1)
+          CODE=$(echo "$RESP" | tail -n1)
+          [ "$CODE" != "200" ] && echo "❌ Auth HTTP $CODE: $BODY" && exit 1
+
           JWT=$(echo "$BODY" | jq -r '.jwt // empty')
-          if [ -z "$JWT" ]; then
-            echo "❌ Portainer auth failed. Body: $BODY"
-            exit 1
-          fi
+          [ -z "$JWT" ] && echo "❌ No JWT in response: $BODY" && exit 1
           echo "jwt=$JWT" >> $GITHUB_OUTPUT
+          echo "curl_flags=$CURL_FLAGS" >> $GITHUB_OUTPUT
           echo "✅ Auth OK"
 
-      - name: Update compose with branch tag
+      - name: Patch compose with new image
         run: |
-          IMAGE="ghcr.io/${{ steps.prep.outputs.owner_lc }}/${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.branch_tag }}"
-          echo "→ Using image: $IMAGE"
-          sed -i "s|image: .*${{ env.IMAGE_NAME }}:.*|image: ${IMAGE}|" docker-compose.yml
+          IMG="${{ steps.prep.outputs.image }}"
+          echo "→ Using image: $IMG"
+          sed -i "s|image: .*${{ env.IMAGE_NAME }}:.*|image: ${IMG}|" docker-compose.yml
           echo "----- docker-compose.yml -----"
           cat docker-compose.yml
           echo "------------------------------"
 
-      - name: Create or Update stack (pullImage=true)
+      - name: Create or Update stack (auto-detect EndpointId, pullImage=true)
         env:
-          BASEURL:  ${{ secrets.PORTAINER_BASEURL }}
-          JWT:      ${{ steps.portainer_auth.outputs.jwt }}
-          STACK:    ${{ secrets.STACK_NAME }}
-          ENDPOINT: ${{ steps.prep.outputs.endpoint_id }}
+          BASEURL: ${{ secrets.PORTAINER_BASEURL }}
+          JWT:     ${{ steps.portainer_auth.outputs.jwt }}
+          CURLF:   ${{ steps.portainer_auth.outputs.curl_flags }}
+          STACK:   ${{ secrets.STACK_NAME }}           # имя стека
+          FALLBACK_ENDPOINT: ${{ secrets.PORTAINER_ENDPOINT_ID || '1' }}
         run: |
-          if [ -z "$STACK" ]; then
-            echo "❌ STACK_NAME secret is empty"
-            exit 1
-          fi
+          [ -z "$STACK" ] && echo "STACK_NAME is empty" && exit 1
 
-          echo "→ Searching stack '$STACK' ..."
-          STACKS=$(curl -fsS -H "Authorization: Bearer $JWT" "$BASEURL/api/stacks")
-          STACK_ID=$(echo "$STACKS" | jq -r ".[] | select(.Name==\"$STACK\") | .Id" | head -n1)
+          echo "→ Lookup stacks…"
+          STACKS=$(curl $CURLF -H "Authorization: Bearer $JWT" "$BASEURL/api/stacks")
+          # Берём точное совпадение по имени
+          STACK_JSON=$(echo "$STACKS" | jq -r ".[] | select(.Name==\"$STACK\") | @json" | head -n1)
 
-          if [ -z "$STACK_ID" ] || [ "$STACK_ID" = "null" ]; then
-            echo "→ Stack not found. Creating..."
-            curl -fsS -X POST "$BASEURL/api/stacks?type=2&method=file&endpointId=$ENDPOINT&pullImage=true" \
+          if [ -z "$STACK_JSON" ]; then
+            echo "→ Stack not found. Creating (endpointId=$FALLBACK_ENDPOINT)…"
+            curl $CURLF -X POST "$BASEURL/api/stacks?type=2&method=file&endpointId=$FALLBACK_ENDPOINT&pullImage=true" \
               -H "Authorization: Bearer $JWT" \
               -F "Name=$STACK" \
               -F "file=@docker-compose.yml" \
-              >/dev/null
+              --fail
             echo "✅ Created stack '$STACK'"
-          else
-            echo "→ Stack exists (id=$STACK_ID). Updating..."
-            curl -fsS -X PUT "$BASEURL/api/stacks/$STACK_ID?endpointId=$ENDPOINT&pullImage=true&prune=true" \
-              -H "Authorization: Bearer $JWT" \
-              -H "Content-Type: multipart/form-data" \
-              -F "file=@docker-compose.yml" \
-              >/dev/null
-            echo "✅ Updated stack '$STACK' (id=$STACK_ID)"
+            exit 0
           fi
+
+          STACK_ID=$(echo "$STACK_JSON" | jq -r '.Id')
+          STACK_ENDPOINT=$(echo "$STACK_JSON" | jq -r '.EndpointId')
+          echo "→ Stack exists: id=$STACK_ID, endpointId=$STACK_ENDPOINT. Updating…"
+
+          # Обновляем именно с тем EndpointId, к которому привязан стек — это устраняет 404
+          curl $CURLF -X PUT "$BASEURL/api/stacks/$STACK_ID?endpointId=$STACK_ENDPOINT&pullImage=true&prune=true" \
+            -H "Authorization: Bearer $JWT" \
+            -H "Content-Type: multipart/form-data" \
+            -F "file=@docker-compose.yml" \
+            --fail
+          echo "✅ Updated stack '$STACK' (id=$STACK_ID)"
