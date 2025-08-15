@@ -459,19 +459,26 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
   quizzes: Dict[int, QuizState] = context.application.bot_data.setdefault("quizzes", {})
   quizzes[chat_id] = QuizState(theme=theme, prize=prize, topic_plan=plan)
 
-  await update.message.reply_text(
-      f"Тема квиза: {theme}\n"
-      f"Приз: {prize}\n\n"
-      f"Всего {QUESTION_COUNT} вопросов. Нужно {PASS_THRESHOLD}+ правильных, чтобы забрать приз.\n"
-      f"На каждый вопрос даётся минимум {OPEN_PERIOD_SECONDS} сек. Ответы не анонимные."
+  # use bot.send_message instead of update.message.reply_text to avoid None update.message errors
+  await context.bot.send_message(
+      chat_id=chat_id,
+      text=(
+          f"Тема квиза: {theme}\n"
+          f"Приз: {prize}\n\n"
+          f"Всего {QUESTION_COUNT} вопросов. Нужно {PASS_THRESHOLD}+ правильных, "
+          f"чтобы забрать приз.\n"
+          f"На каждый вопрос даётся минимум {OPEN_PERIOD_SECONDS} сек. Ответы не анонимные."
+      ),
   )
 
   await countdown_then(ask_next_question, context, chat_id, seconds=FIRST_COUNTDOWN_SECONDS)
 
 async def cmd_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
   stats = load_stats()
+  # Determine chat_id once to reuse in send_message calls
+  chat_id = update.effective_chat.id
   if not stats:
-    await update.message.reply_text("Статистика пуста.")
+    await context.bot.send_message(chat_id=chat_id, text="Статистика пуста.")
     return
   rows = sorted(
       stats.values(),
@@ -485,7 +492,7 @@ async def cmd_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"правильных ответов: {r.get('correct_answers_total',0)}, "
         f"квизов сыграно: {r.get('quizzes_played',0)}"
     )
-  await update.message.reply_text("\n".join(lines))
+  await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
 
 async def ask_next_question(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
   quizzes: Dict[int, QuizState] = context.application.bot_data.get("quizzes", {})
