@@ -95,11 +95,17 @@ jobs:
           echo "curl_flags=$CURL_FLAGS" >> $GITHUB_OUTPUT
           echo "✅ Auth OK"
 
-      - name: Patch compose with new image
+      - name: Patch compose with new image and secrets
         run: |
           IMG="${{ steps.prep.outputs.image }}"
           echo "→ Using image: $IMG"
+
+          # заменяем тег образа
           sed -i "s|image: .*${{ env.IMAGE_NAME }}:.*|image: ${IMG}|" docker-compose.yml
+          
+          sed -i "s|\${TELEGRAM_BOT_TOKEN}|${{ secrets.TELEGRAM_BOT_TOKEN }}|" docker-compose.yml
+          sed -i "s|\${OPENAI_TOKEN}|${{ secrets.OPENAI_TOKEN }}|" docker-compose.yml
+
           echo "----- docker-compose.yml -----"
           cat docker-compose.yml
           echo "------------------------------"
