@@ -104,19 +104,18 @@ jobs:
           cat docker-compose.yml
           echo "------------------------------"
 
-      - name: Create or Update stack (auto-detect EndpointId, pullImage=true)
+      - name: Create or Update stack (auto-detect EndpointId, pull image)
         env:
           BASEURL: ${{ secrets.PORTAINER_BASEURL }}
           JWT:     ${{ steps.portainer_auth.outputs.jwt }}
           CURLF:   ${{ steps.portainer_auth.outputs.curl_flags }}
-          STACK:   ${{ secrets.STACK_NAME }}           # имя стека
+          STACK:   ${{ secrets.STACK_NAME }}
           FALLBACK_ENDPOINT: ${{ secrets.PORTAINER_ENDPOINT_ID || '1' }}
         run: |
           [ -z "$STACK" ] && echo "STACK_NAME is empty" && exit 1
 
           echo "→ Lookup stacks…"
           STACKS=$(curl $CURLF -H "Authorization: Bearer $JWT" "$BASEURL/api/stacks")
-          # Берём точное совпадение по имени
           STACK_JSON=$(echo "$STACKS" | jq -r ".[] | select(.Name==\"$STACK\") | @json" | head -n1)
 
           if [ -z "$STACK_JSON" ]; then
@@ -134,10 +133,12 @@ jobs:
           STACK_ENDPOINT=$(echo "$STACK_JSON" | jq -r '.EndpointId')
           echo "→ Stack exists: id=$STACK_ID, endpointId=$STACK_ENDPOINT. Updating…"
 
-          # Обновляем именно с тем EndpointId, к которому привязан стек — это устраняет 404
-          curl $CURLF -X PUT "$BASEURL/api/stacks/$STACK_ID?endpointId=$STACK_ENDPOINT&pullImage=true&prune=true" \
+          CONTENT=$(jq -Rs . < docker-compose.yml)
+          BODY=$(jq -n --argjson content "$CONTENT" '{StackFileContent: $content, Prune: true, PullImage: true, Env: []}')
+
+          curl $CURLF -X PUT "$BASEURL/api/stacks/$STACK_ID?endpointId=$STACK_ENDPOINT" \
             -H "Authorization: Bearer $JWT" \
-            -H "Content-Type: multipart/form-data" \
-            -F "file=@docker-compose.yml" \
+            -H "Content-Type: application/json" \
+            --data-raw "$BODY" \
             --fail
           echo "✅ Updated stack '$STACK' (id=$STACK_ID)"
