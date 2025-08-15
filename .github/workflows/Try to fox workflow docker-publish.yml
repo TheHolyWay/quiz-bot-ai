@@ -56,19 +56,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Prepare tags
+        id: prep
+        run: |
+          OWNER_LC=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          BRANCH_TAG=${GITHUB_REF_NAME//\//-}
+          echo "owner_lc=$OWNER_LC" >> $GITHUB_OUTPUT
+          echo "branch_tag=$BRANCH_TAG" >> $GITHUB_OUTPUT
+
       - name: Login to Portainer API
         id: portainer_auth
         run: |
-          JWT=$(curl -s -X POST "http://${{ secrets.PORTAINER_IP }}/api/auth" \
+          RESPONSE=$(curl -s -X POST "http://${{ secrets.PORTAINER_IP }}/api/auth" \
             -H "Content-Type: application/json" \
-            -d "{\"username\": \"${{ secrets.PORTAINER_USER }}\", \"password\": \"${{ secrets.PORTAINER_PASS }}\"}" \
-            | jq -r '.jwt')
+            -d "{\"username\": \"${{ secrets.PORTAINER_USER }}\", \"password\": \"${{ secrets.PORTAINER_PASS }}\"}")
+          JWT=$(echo "$RESPONSE" | jq -r '.jwt')
+          if [ -z "$JWT" ] || [ "$JWT" = "null" ]; then
+            echo "❌ Portainer auth failed. Response: $RESPONSE"
+            exit 1
+          fi
           echo "jwt=$JWT" >> $GITHUB_OUTPUT
 
       - name: Update compose file with new tag
         run: |
-          BRANCH_TAG=${GITHUB_REF_NAME//\//-}
-          sed -i "s|ghcr.io/.*/${{ env.IMAGE_NAME }}:.*|ghcr.io/${{ steps.prep.outputs.owner_lc }}/${{ env.IMAGE_NAME }}:${BRANCH_TAG}|" docker-compose.yml
+          sed -i "s|ghcr.io/.*/${{ env.IMAGE_NAME }}:.*|ghcr.io/${{ steps.prep.outputs.owner_lc }}/${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.branch_tag }}|" docker-compose.yml
 
       - name: Deploy updated stack to Portainer
         run: |
