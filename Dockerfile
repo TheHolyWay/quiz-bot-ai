@@ -13,7 +13,7 @@ RUN python -m pip install --no-cache-dir -r requirements.txt
 
 COPY quiz.py /app/quiz.py
 
-RUM chmod 777 -R /app
+RUN chmod 777 -R /app
 
 
 CMD ["python", "-u", "/app/quiz.py"]
