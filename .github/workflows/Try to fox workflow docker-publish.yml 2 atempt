@@ -1,0 +1,147 @@
+# .github/workflows/build-and-deploy-portainer.yml
+name: Build & Deploy to Portainer (GHCR)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: quiz-bot
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare tags (owner lowercase + branch tag)
+        id: prep
+        run: |
+          OWNER_LC=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          BRANCH_TAG=${GITHUB_REF_NAME//\//-}
+          echo "owner_lc=$OWNER_LC" >> $GITHUB_OUTPUT
+          echo "branch_tag=$BRANCH_TAG" >> $GITHUB_OUTPUT
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & Push image to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/${{ steps.prep.outputs.owner_lc }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ghcr.io/${{ steps.prep.outputs.owner_lc }}/${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.branch_tag }}
+            ghcr.io/${{ steps.prep.outputs.owner_lc }}/${{ env.IMAGE_NAME }}:latest
+
+  deploy-to-portainer:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure jq is present
+        run: sudo apt-get update -qq && sudo apt-get install -y jq
+
+      - name: Prepare tags (owner lowercase + branch tag)
+        id: prep
+        run: |
+          OWNER_LC=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          BRANCH_TAG=${GITHUB_REF_NAME//\//-}
+          echo "owner_lc=$OWNER_LC" >> $GITHUB_OUTPUT
+          echo "branch_tag=$BRANCH_TAG" >> $GITHUB_OUTPUT
+          # endpoint id default
+          echo "endpoint_id=${{ secrets.PORTAINER_ENDPOINT_ID || '1' }}" >> $GITHUB_OUTPUT
+
+      - name: Login to Portainer API (with checks)
+        id: portainer_auth
+        env:
+          BASEURL: ${{ secrets.PORTAINER_BASEURL }}
+          USER:    ${{ secrets.PORTAINER_USER }}
+          PASS:    ${{ secrets.PORTAINER_PASS }}
+        run: |
+          if [ -z "$BASEURL" ]; then
+            echo "❌ PORTAINER_BASEURL is empty. Example: https://portainer.example.com:9443"
+            exit 1
+          fi
+          echo "→ Auth to $BASEURL ..."
+          # забираем и тело и код ответа
+          HTTP_CODE=$(mktemp)
+          RESP=$(curl -fsS -m 20 -w "%{http_code}" -o "$HTTP_CODE" \
+            -X POST "$BASEURL/api/auth" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"$USER\",\"password\":\"$PASS\"}" || true)
+          BODY=$(cat "$HTTP_CODE"); rm -f "$HTTP_CODE"
+
+          if [ "$RESP" != "200" ]; then
+            echo "❌ Portainer auth HTTP $RESP. Body: $BODY"
+            exit 1
+          fi
+          JWT=$(echo "$BODY" | jq -r '.jwt // empty')
+          if [ -z "$JWT" ]; then
+            echo "❌ Portainer auth failed. Body: $BODY"
+            exit 1
+          fi
+          echo "jwt=$JWT" >> $GITHUB_OUTPUT
+          echo "✅ Auth OK"
+
+      - name: Update compose with branch tag
+        run: |
+          IMAGE="ghcr.io/${{ steps.prep.outputs.owner_lc }}/${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.branch_tag }}"
+          echo "→ Using image: $IMAGE"
+          sed -i "s|image: .*${{ env.IMAGE_NAME }}:.*|image: ${IMAGE}|" docker-compose.yml
+          echo "----- docker-compose.yml -----"
+          cat docker-compose.yml
+          echo "------------------------------"
+
+      - name: Create or Update stack (pullImage=true)
+        env:
+          BASEURL:  ${{ secrets.PORTAINER_BASEURL }}
+          JWT:      ${{ steps.portainer_auth.outputs.jwt }}
+          STACK:    ${{ secrets.STACK_NAME }}
+          ENDPOINT: ${{ steps.prep.outputs.endpoint_id }}
+        run: |
+          if [ -z "$STACK" ]; then
+            echo "❌ STACK_NAME secret is empty"
+            exit 1
+          fi
+
+          echo "→ Searching stack '$STACK' ..."
+          STACKS=$(curl -fsS -H "Authorization: Bearer $JWT" "$BASEURL/api/stacks")
+          STACK_ID=$(echo "$STACKS" | jq -r ".[] | select(.Name==\"$STACK\") | .Id" | head -n1)
+
+          if [ -z "$STACK_ID" ] || [ "$STACK_ID" = "null" ]; then
+            echo "→ Stack not found. Creating..."
+            curl -fsS -X POST "$BASEURL/api/stacks?type=2&method=file&endpointId=$ENDPOINT&pullImage=true" \
+              -H "Authorization: Bearer $JWT" \
+              -F "Name=$STACK" \
+              -F "file=@docker-compose.yml" \
+              >/dev/null
+            echo "✅ Created stack '$STACK'"
+          else
+            echo "→ Stack exists (id=$STACK_ID). Updating..."
+            curl -fsS -X PUT "$BASEURL/api/stacks/$STACK_ID?endpointId=$ENDPOINT&pullImage=true&prune=true" \
+              -H "Authorization: Bearer $JWT" \
+              -H "Content-Type: multipart/form-data" \
+              -F "file=@docker-compose.yml" \
+              >/dev/null
+            echo "✅ Updated stack '$STACK' (id=$STACK_ID)"
+          fi
