@@ -21,7 +21,9 @@ jobs:
       - name: Prepare tags
         id: prep
         run: |
+          OWNER_LC=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
           BRANCH_TAG=${GITHUB_REF_NAME//\//-}
+          echo "owner_lc=$OWNER_LC" >> $GITHUB_OUTPUT
           echo "branch_tag=$BRANCH_TAG" >> $GITHUB_OUTPUT
 
       - name: Set up QEMU
@@ -44,8 +46,8 @@ jobs:
           push: true
           platforms: linux/amd64
           tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.branch_tag }}
+            ghcr.io/${{ steps.prep.outputs.owner_lc }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ghcr.io/${{ steps.prep.outputs.owner_lc }}/${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.branch_tag }}
 
   deploy-to-portainer:
     needs: build-and-push
@@ -66,11 +68,11 @@ jobs:
       - name: Update compose file with new tag
         run: |
           BRANCH_TAG=${GITHUB_REF_NAME//\//-}
-          sed -i "s|ghcr.io/.*/${{ env.IMAGE_NAME }}:.*|ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${BRANCH_TAG}|" docker-compose.yml
+          sed -i "s|ghcr.io/.*/${{ env.IMAGE_NAME }}:.*|ghcr.io/${{ steps.prep.outputs.owner_lc }}/${{ env.IMAGE_NAME }}:${BRANCH_TAG}|" docker-compose.yml
 
       - name: Deploy updated stack to Portainer
         run: |
-          curl -s -X PUT "http://${{ secrets.PORTAINER_IP }}/api/stacks/${{ secrets.PORTAINER_STACK_ID }}?endpointId=1" \
+          curl -s -X PUT "http://${{ secrets.PORTAINER_IP }}/api/stacks/${{ secrets.PORTAINER_STACK_ID }}?endpointId=1&pullImage=true" \
             -H "Authorization: Bearer ${{ steps.portainer_auth.outputs.jwt }}" \
             -H "Content-Type: multipart/form-data" \
             -F "file=@docker-compose.yml" \
