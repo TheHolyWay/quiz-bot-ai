@@ -1,0 +1,10 @@
+version: '3.3'
+services:
+  quizbot:
+    image: ghcr.io/mrMigles/quiz-bot:latest
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
+      OPENAI_TOKEN: "${OPENAI_TOKEN}"
+      QUIZ_OPENAI_MODEL: "gpt-4o"
+      QUIZ_OPENAI_VERIFIER: "gpt-4o-mini"
