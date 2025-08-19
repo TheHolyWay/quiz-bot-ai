@@ -11,12 +11,6 @@ Fixes:
 - Призы считаются один раз за квиз. Идемпотентность финала через флаг finished.
 - Трекинг имени пользователя — по вашему лямбда-сниппету.
 
-Дополнения:
-- /stop — мгновенно останавливает квиз.
-- Перед стартом квиза упоминаем всех админов чата.
-- Анти-галлюцинационная верификация: проверяем, что РОВНО один вариант фактически верный.
-  При проблеме — ОДНА автоматическая правка (переписать вопрос или заменить одну опцию) и повторная проверка.
-
 Env:
 - TELEGRAM_BOT_TOKEN, OPENAI_TOKEN
 - QUIZ_OPENAI_MODEL     (default: gpt-4o)
@@ -210,72 +204,6 @@ def _shuffle_options_keep_answer(options: List[str], correct_index: int) -> Tupl
   return shuffled, new_correct
 
 # ==========================
-# Anti-hallucination verifier
-# ==========================
-
-async def _verify_and_suggest_fix(
-    theme: str,
-    topic: str,
-    diff: str,
-    q_text: str,
-    options: List[str],
-    nonce: str,
-) -> Tuple[bool, int, str, Optional[dict]]:
-  """
-  Возвращает:
-    (is_valid, correct_index, explanation, fix)
-  где fix либо None, либо dict одной из форм:
-    {"rewrite_question": "новая формулировка", "correct_index": <0..3>}
-    {"fix_option_index": <0..3>, "new_option_text": "исправленный текст"}
-  """
-  sys_ver = (
-    "Ты строгий верификатор фактологии и ясности квиз-вопросов на русском.\n"
-    "Проверь, что РОВНО ОДИН вариант ответа фактически корректен и небанально доказуем. "
-    "Если условие не выполнено (ни один не верен, несколько верны, вопрос двусмысленный), "
-    "верни verdict='invalid' и предложи МИНИМАЛЬНУЮ правку: либо перепиши вопрос так, "
-    "чтобы ровно один вариант стал правильным, либо замени текст одной правильной опции. "
-    "Количество опций должно остаться равно 4. Сохраняй тему и сложность."
-  )
-  user_ver = f"""
-Вопрос: {q_text}
-Варианты (индексы 0..3):
-0) {options[0]}
-1) {options[1]}
-2) {options[2]}
-3) {options[3]}
-
-Контекст:
-- Тема: {theme}
-- Подтема: {topic}
-- Сложность: {diff}
-
-Требуемый JSON РОВНО в этой форме:
-{{
-  "verdict": "ok" | "invalid",
-  "correct_index": 0,
-  "explanation": "кратко, <=160 символов",
-  "fix": null
-    | {{"rewrite_question": "новая формулировка", "correct_index": 0}}
-    | {{"fix_option_index": 0, "new_option_text": "исправленный текст"}}
-}}
-[nonce:{nonce}]
-"""
-  try:
-    resp = await asyncio.to_thread(_chat_json, VER_MODEL, sys_ver, user_ver, 0.15, 420)
-    data = json.loads((resp.choices[0].message.content or "").strip())
-    verdict = str(data.get("verdict", "ok")).lower().strip()
-    exp = _safe_trim(str(data.get("explanation", "")), 190)
-    ci = int(data.get("correct_index", 0))
-    fix = data.get("fix")
-    if verdict not in ("ok", "invalid"):
-      verdict = "ok"
-    valid = verdict == "ok" and 0 <= ci < 4
-    return valid, ci if 0 <= ci < 4 else 0, exp, (fix if verdict == "invalid" else None)
-  except Exception:
-    # Если верификация не удалась — считаем как валидное без фикса
-    return True, 0, "Проверка: принят наиболее корректный вариант.", None
-
-# ==========================
 # LLM-driven Theme & Plan
 # ==========================
 
@@ -385,7 +313,6 @@ async def generate_question(theme: str, question_idx: int, topic: str, avoid_phr
 [nonce:{nonce}]
 """
 
-  # 1) Генерация
   try:
     resp_gen = await asyncio.to_thread(_chat_json, GEN_MODEL, sys_gen, user_gen, 0.85, 450)
     gen_text = (resp_gen.choices[0].message.content or "").strip()
@@ -397,42 +324,44 @@ async def generate_question(theme: str, question_idx: int, topic: str, avoid_phr
     if not (0 <= correct_idx < 4) or not q_text or len(options) != 4:
       raise ValueError("Bad generation schema")
   except Exception:
-    # Безопасный дефолт
     q_text = f"{theme}: выберите верный вариант."
     options = ["Самый очевидный ответ", "Правильный ответ", "Очень заманчивый вариант", "Случайный выбор"]
     correct_idx = 1
     explanation = "Правильный вариант соответствует общепризнанным фактам."
-    return CurrentQuestion(text=q_text, options=options, correct_index=correct_idx, explanation=explanation)
 
-  # 2) Верификация №1
-  valid, v_idx, v_exp, fix = await _verify_and_suggest_fix(theme, topic, diff, q_text, options, nonce)
-  if valid:
-    return CurrentQuestion(text=q_text, options=options, correct_index=v_idx, explanation=(v_exp or explanation))
+  sys_ver = (
+    "Ты строгий верификатор квиз-вопросов. Определи ОДИН корректный индекс (0..3) и кратко объясни."
+  )
+  user_ver = f"""
+Вопрос: {q_text}
+Варианты (индексированы 0..3):
+0) {options[0]}
+1) {options[1]}
+2) {options[2]}
+3) {options[3]}
 
-  # 3) ОДНА попытка авто-фикса (или вопроса, или опции)
+Контекст:
+- Тема: {theme}
+- Подтема: {topic}
+- Сложность: {diff}
+
+Верни строго JSON:
+{{ "correct_index": 0, "explanation": "краткая причина (<=160 символов)" }}
+[nonce:{nonce}]
+"""
   try:
-    if isinstance(fix, dict) and "rewrite_question" in fix:
-      q_text = _safe_trim(str(fix.get("rewrite_question", q_text)), 240)
-      if isinstance(fix.get("correct_index"), int) and 0 <= int(fix["correct_index"]) < 4:
-        correct_idx = int(fix["correct_index"])
-    elif isinstance(fix, dict) and "fix_option_index" in fix and "new_option_text" in fix:
-      i = int(fix.get("fix_option_index", -1))
-      if 0 <= i < 4:
-        options[i] = _safe_trim(str(fix.get("new_option_text", options[i])), 100)
-        correct_idx = i  # эта опция теперь должна быть правильной
-    options = _sanitize_options(options)
+    resp_ver = await asyncio.to_thread(_chat_json, VER_MODEL, sys_ver, user_ver, 0.2, 220)
+    ver_text = (resp_ver.choices[0].message.content or "").strip()
+    ver = json.loads(ver_text)
+    v_idx = int(ver.get("correct_index", correct_idx))
+    v_exp = _safe_trim(str(ver.get("explanation", explanation)), 190)
+    if 0 <= v_idx < 4:
+      correct_idx = v_idx
+      explanation = v_exp
   except Exception:
     pass
 
-  # 4) Повторная верификация после фикса
-  valid2, v2_idx, v2_exp, _ = await _verify_and_suggest_fix(theme, topic, diff, q_text, options, nonce)
-  if valid2:
-    return CurrentQuestion(text=q_text, options=options, correct_index=v2_idx, explanation=(v2_exp or explanation))
-
-  # 5) Если и после фикса плохо — безопасный дефолт
-  q_text = f"{theme}: выберите верный вариант."
-  options = ["Самый очевидный ответ", "Правильный ответ", "Очень заманчивый вариант", "Случайный выбор"]
-  return CurrentQuestion(text=q_text, options=options, correct_index=1, explanation="Правильный вариант соответствует общепризнанным фактам.")
+  return CurrentQuestion(text=q_text, options=options, correct_index=correct_idx, explanation=explanation)
 
 # ==========================
 # Async utilities (no JobQueue)
@@ -515,6 +444,7 @@ def parse_theme_from_args(args: List[str]) -> Optional[str]:
   theme = " ".join(a for a in args if a).strip()
   return theme or None
 
+# --- NEW: mention admins before the quiz starts
 async def mention_admins(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
   """Mention all chat admins: @username if present, else HTML mention link."""
   try:
@@ -533,7 +463,7 @@ async def mention_admins(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> No
     text = "Зовём участников (админы): " + ", ".join(parts)
     await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
   except Exception:
-    # Silent fail to avoid любой спам
+    # Silent fail to avoid any noise in chat
     pass
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -554,6 +484,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
   # Mention admins before quiz info/countdown
   await mention_admins(context, chat_id)
 
+  # use bot.send_message instead of update.message.reply_text to avoid None update.message errors
   await context.bot.send_message(
       chat_id=chat_id,
       text=(
@@ -587,6 +518,7 @@ async def cmd_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
   await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
 
+# --- NEW: /stop command
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
   """Stop current quiz silently and clean state."""
   chat_id = update.effective_chat.id
@@ -695,7 +627,7 @@ async def on_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
   quiz.answers[user.id] = chosen
   quiz.answered_users.add(user.id)
-  quiz.participants.add(user.id)  # считаем всех участников квиза
+  quiz.participants.add(user.id)  # фикс: считаем всех участников квиза
 
   if chosen == quiz.current_q.correct_index:
     quiz.scores[user.id] = quiz.scores.get(user.id, 0) + 1
@@ -760,7 +692,7 @@ async def finalize_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
     quizzes.pop(chat_id, None)
 
 # ==========================
-# Error handler (silent)
+# Error handler
 # ==========================
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -768,7 +700,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
   import traceback
   err = "".join(traceback.format_exception(None, context.error, context.error.__traceback__))
   print("ERROR:", err)
-  # Никаких сообщений в чат, чтобы не было «Упс…» спама.
+  # No chat messages here to avoid any "Oops" spam.
 
 # ==========================
 # App bootstrap
@@ -799,7 +731,7 @@ def main():
 
   # Команды
   app.add_handler(CommandHandler("start", cmd_start))
-  app.add_handler(CommandHandler("stop", cmd_stop))
+  app.add_handler(CommandHandler("stop", cmd_stop))          # NEW
   app.add_handler(CommandHandler("statistics", cmd_statistics))
 
   # Ответы на опросы
